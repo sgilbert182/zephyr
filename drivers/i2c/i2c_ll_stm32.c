@@ -145,7 +145,8 @@ static int i2c_stm32_transfer(const struct device *dev, struct i2c_msg *msg,
 			      uint8_t num_msgs, uint16_t slave)
 {
 	struct i2c_stm32_data *data = dev->data;
-	struct i2c_msg *current, *next;
+	struct i2c_msg *current;
+	struct i2c_msg *next = NULL;
 	int ret = 0;
 
 	/* Check for validity of all messages, to prevent having to abort
@@ -392,6 +393,11 @@ static int i2c_stm32_init(const struct device *dev)
 	k_sem_init(&data->device_sync_sem, 0, K_SEM_MAX_LIMIT);
 	cfg->irq_config_func(dev);
 #endif
+
+#ifdef I2C_STM32_V2_DMA
+	k_sem_init(&data->dma_rx_sem, 1, K_SEM_MAX_LIMIT);
+	k_sem_init(&data->dma_tx_sem, 1, K_SEM_MAX_LIMIT);
+#endif /* I2C_STM32_V2_DMA */
 
 	data->is_configured = false;
 	data->mode = I2CSTM32MODE_I2C;
