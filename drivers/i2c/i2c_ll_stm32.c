@@ -145,7 +145,8 @@ static int i2c_stm32_transfer(const struct device *dev, struct i2c_msg *msg,
 			      uint8_t num_msgs, uint16_t slave)
 {
 	struct i2c_stm32_data *data = dev->data;
-	struct i2c_msg *current, *next;
+	struct i2c_msg *current;
+	struct i2c_msg *next = NULL;
 	int ret = 0;
 
 	/* Check for validity of all messages, to prevent having to abort
@@ -203,13 +204,7 @@ static int i2c_stm32_transfer(const struct device *dev, struct i2c_msg *msg,
 	current = msg;
 
 	while (num_msgs > 0) {
-		uint8_t *next_msg_flags = NULL;
-
-		if (num_msgs > 1) {
-			next = current + 1;
-			next_msg_flags = &(next->flags);
-		}
-		ret = stm32_i2c_transaction(dev, *current, next_msg_flags, slave);
+		ret = stm32_i2c_transaction(dev, *current, next ? &(next->flags) : NULL, slave);
 		if (ret < 0) {
 			break;
 		}
@@ -391,6 +386,11 @@ static int i2c_stm32_init(const struct device *dev)
 #ifdef CONFIG_I2C_STM32_INTERRUPT
 	k_sem_init(&data->device_sync_sem, 0, K_SEM_MAX_LIMIT);
 	cfg->irq_config_func(dev);
+#endif
+
+#ifdef CONFIG_I2C_DMA
+	k_sem_init(&data->dma_rx_sem, 1, K_SEM_MAX_LIMIT);
+	k_sem_init(&data->dma_tx_sem, 1, K_SEM_MAX_LIMIT);
 #endif
 
 	data->is_configured = false;
