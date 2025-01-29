@@ -23,79 +23,9 @@
 #include <zephyr/irq.h>
 LOG_MODULE_REGISTER(i2s_ll_stm32);
 
-#define MODULO_INC(val, max) { val = (++val < max) ? val : 0; }
-
 static unsigned int div_round_closest(uint32_t dividend, uint32_t divisor)
 {
 	return (dividend + (divisor / 2U)) / divisor;
-}
-
-static bool queue_is_empty(struct ring_buffer *rb)
-{
-	unsigned int key;
-
-	key = irq_lock();
-
-	if (rb->tail != rb->head) {
-		/* Ring buffer is not empty */
-		irq_unlock(key);
-		return false;
-	}
-
-	irq_unlock(key);
-
-	return true;
-}
-
-/*
- * Get data from the queue
- */
-static int queue_get(struct ring_buffer *rb, void **mem_block, size_t *size)
-{
-	unsigned int key;
-
-	key = irq_lock();
-
-	if (queue_is_empty(rb) == true) {
-		irq_unlock(key);
-		return -ENOMEM;
-	}
-
-	*mem_block = rb->buf[rb->tail].mem_block;
-	*size = rb->buf[rb->tail].size;
-	MODULO_INC(rb->tail, rb->len);
-
-	irq_unlock(key);
-
-	return 0;
-}
-
-/*
- * Put data in the queue
- */
-static int queue_put(struct ring_buffer *rb, void *mem_block, size_t size)
-{
-	uint16_t head_next;
-	unsigned int key;
-
-	key = irq_lock();
-
-	head_next = rb->head;
-	MODULO_INC(head_next, rb->len);
-
-	if (head_next == rb->tail) {
-		/* Ring buffer is full */
-		irq_unlock(key);
-		return -ENOMEM;
-	}
-
-	rb->buf[rb->head].mem_block = mem_block;
-	rb->buf[rb->head].size = size;
-	rb->head = head_next;
-
-	irq_unlock(key);
-
-	return 0;
 }
 
 static int i2s_stm32_enable_clock(const struct device *dev)
@@ -385,7 +315,7 @@ do_trigger_stop:
 		}
 
 		if (dir == I2S_DIR_TX) {
-			if ((queue_is_empty(&stream->mem_block_queue) == false) ||
+			if ((ring_buf_is_empty(&stream->mem_block_queue) == false) ||
 						(ll_func_i2s_dma_busy(cfg->i2s))) {
 				stream->state = I2S_STATE_STOPPING;
 				/*
@@ -452,9 +382,9 @@ static int i2s_stm32_read(const struct device *dev, void **mem_block,
 		}
 	}
 
-	/* Get data from the beginning of RX queue */
-	ret = queue_get(&dev_data->rx.mem_block_queue, mem_block, size);
-	if (ret < 0) {
+	/* Get data from the RX ring buffer */
+	*size = ring_buf_get(&dev_data->rx.mem_block_queue, (uint8_t *)mem_block, *size);
+	if (*size < 0) {
 		return -EIO;
 	}
 
@@ -480,7 +410,7 @@ static int i2s_stm32_write(const struct device *dev, void *mem_block,
 	}
 
 	/* Add data to the end of the TX queue */
-	return queue_put(&dev_data->tx.mem_block_queue, mem_block, size);
+	return ring_buf_put(&dev_data->tx.mem_block_queue, (uint8_t *)&mem_block, size);
 }
 
 static DEVICE_API(i2s, i2s_stm32_driver_api) = {
@@ -604,8 +534,8 @@ static void dma_rx_callback(const struct device *dma_dev, void *arg,
 	sys_cache_data_invd_range(mblk_tmp, stream->cfg.block_size);
 
 	/* All block data received */
-	ret = queue_put(&stream->mem_block_queue, mblk_tmp,
-			stream->cfg.block_size);
+	ret = ring_buf_put(&stream->mem_block_queue, (uint8_t *)&mblk_tmp,
+		     stream->cfg.block_size);
 	if (ret < 0) {
 		stream->state = I2S_STATE_ERROR;
 		goto rx_disable;
@@ -659,7 +589,7 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg,
 		 * as stated in zephyr i2s specification, in case of DRAIN command
 		 * send all data in the transmit queue and stop the transmission.
 		 */
-		if (queue_is_empty(&stream->mem_block_queue) == true) {
+		if (ring_buf_is_empty(&stream->mem_block_queue) == true) {
 			stream->queue_drop(stream);
 			stream->state = I2S_STATE_READY;
 			goto tx_disable;
@@ -681,8 +611,12 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg,
 	}
 
 	/* Prepare to send the next data block */
-	ret = queue_get(&stream->mem_block_queue, &stream->mem_block,
-			&mem_block_size);
+	mem_block_size = ring_buf_get(&stream->mem_block_queue,
+					(uint8_t *)&stream->mem_block, mem_block_size);
+	if (mem_block_size < 0) {
+		return;
+	}
+
 	if (ret < 0) {
 		if (stream->state == I2S_STATE_STOPPING) {
 			stream->state = I2S_STATE_READY;
@@ -769,6 +703,9 @@ static int i2s_stm32_initialize(const struct device *dev)
 	k_sem_init(&dev_data->tx.sem, CONFIG_I2S_STM32_TX_BLOCK_COUNT,
 		   CONFIG_I2S_STM32_TX_BLOCK_COUNT);
 
+	ring_buf_internal_reset(&dev_data->tx.mem_block_queue, 0);
+	ring_buf_internal_reset(&dev_data->rx.mem_block_queue, 0);
+
 	for (i = 0; i < STM32_DMA_NUM_CHANNELS; i++) {
 		active_dma_rx_channel[i] = NULL;
 		active_dma_tx_channel[i] = NULL;
@@ -847,10 +784,10 @@ static int tx_stream_start(struct stream *stream, const struct device *dev)
 	size_t mem_block_size;
 	int ret;
 
-	ret = queue_get(&stream->mem_block_queue, &stream->mem_block,
-			&mem_block_size);
-	if (ret < 0) {
-		return ret;
+	mem_block_size = ring_buf_get(&stream->mem_block_queue,
+					(uint8_t *)&stream->mem_block, mem_block_size);
+	if (mem_block_size < 0) {
+		return -EIO;
 	}
 	k_sem_give(&stream->sem);
 
@@ -953,7 +890,7 @@ static void rx_queue_drop(struct stream *stream)
 	size_t size;
 	void *mem_block;
 
-	while (queue_get(&stream->mem_block_queue, &mem_block, &size) == 0) {
+	while (ring_buf_get_claim(&stream->mem_block_queue, mem_block, size) == 0) {
 		k_mem_slab_free(stream->cfg.mem_slab, mem_block);
 	}
 
@@ -966,7 +903,7 @@ static void tx_queue_drop(struct stream *stream)
 	void *mem_block;
 	unsigned int n = 0U;
 
-	while (queue_get(&stream->mem_block_queue, &mem_block, &size) == 0) {
+	while (ring_buf_get_claim(&stream->mem_block_queue, mem_block, size) == 0) {
 		k_mem_slab_free(stream->cfg.mem_slab, mem_block);
 		n++;
 	}
@@ -985,6 +922,13 @@ static const struct device *get_dev_from_tx_dma_channel(uint32_t dma_channel)
 {
 	return active_dma_tx_channel[dma_channel];
 }
+
+#define I2S_RING_BUF_INIT(name, size8)                          \
+    static uint8_t __noinit _ring_buffer_data_##name[size8];    \
+    .mem_block_queue = {                                       \
+        .buffer = _ring_buffer_data_##name,                    \
+        .size = size8,                                         \
+    }
 
 /* src_dev and dest_dev should be 'MEMORY' or 'PERIPHERAL'. */
 #define I2S_DMA_CHANNEL_INIT(index, dir, dir_cap, src_dev, dest_dev)	\
@@ -1012,8 +956,7 @@ static const struct device *get_dev_from_tx_dma_channel(uint32_t dma_channel)
 	.stream_start = dir##_stream_start,				\
 	.stream_disable = dir##_stream_disable,				\
 	.queue_drop = dir##_queue_drop,					\
-	.mem_block_queue.buf = dir##_##index##_ring_buf,		\
-	.mem_block_queue.len = ARRAY_SIZE(dir##_##index##_ring_buf)	\
+	.mem_block_queue = RING_BUF_INIT(dir##_##index##_ring_buf, sizeof(dir##_##index##_ring_buf)),                                            \
 }
 
 #define I2S_STM32_INIT(index)							\
@@ -1034,8 +977,8 @@ static const struct i2s_stm32_cfg i2s_stm32_config_##index = {		\
 	.master_clk_sel = DT_INST_PROP(index, mck_enabled)		\
 };									\
 									\
-struct queue_item rx_##index##_ring_buf[CONFIG_I2S_STM32_RX_BLOCK_COUNT + 1];\
-struct queue_item tx_##index##_ring_buf[CONFIG_I2S_STM32_TX_BLOCK_COUNT + 1];\
+static uint8_t rx_##index##_ring_buf[sizeof(struct queue_item) * (CONFIG_I2S_STM32_RX_BLOCK_COUNT + 1)]; \
+static uint8_t tx_##index##_ring_buf[sizeof(struct queue_item) * (CONFIG_I2S_STM32_TX_BLOCK_COUNT + 1)]; \
 									\
 static struct i2s_stm32_data i2s_stm32_data_##index = {			\
 	UTIL_AND(DT_INST_DMAS_HAS_NAME(index, rx),			\
